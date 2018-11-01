@@ -1,0 +1,220 @@
+//////////////////////////////////////////////////////////////////////
+// Shared project-specific material functions
+
+// linear version of smoothstep, analogous to nubis remap
+// 0 if x < lo, linear ramp from 0-1 for lo <= x <= hi. 1 for x > hi
+float linearstep(float lo, float hi, float x) {
+    return saturate((x - lo) / (hi - lo));
+}
+
+// combination of Voronoi and Perlin noise for base cloud density
+float CloudNoise(float3 P) {
+    // one octave of Voronoi noise, with six cycles before repeating
+    P *= 6;
+    float vnoise = VoronoiNoise3D_ALU(P, 6., true, 6., true).w;
+
+    // three octaves of a Perlin noise, 3x the frequency of the Voronoi
+    P *= 3;
+    float pnoise = 0;
+    pnoise += JacobianSimplex_ALU(   P, true, 9.)[0].w;
+    pnoise += JacobianSimplex_ALU(2.*P, true, 9.)[0].w / 2;
+    pnoise += JacobianSimplex_ALU(4.*P, true, 9.)[0].w / 4;
+    vnoise = 0.5 - 0.5 * vnoise;
+    pnoise = 0.5 + 0.5 * pnoise;
+
+    // blend the two noises
+    return lerp(vnoise, pnoise, 0.9);
+}
+
+// Compute tiles for 2D texture to be used as a 3D cubic volume atlas
+// return.x = Number of X tiles
+// return.y = Number of Y tiles
+// return.z = Tile size (so volume is size x size x size)
+float3 TileSize(Texture2D Texture) {
+    // get size of texture
+    float2 TexSize;
+    Texture.GetDimensions(TexSize.x, TexSize.y);
+
+    // tile size is cube root of total number of texels
+    float TotalTexels = TexSize.x * TexSize.y;
+    float Tile = floor(pow(TotalTexels, 1./3.) + 0.5);
+
+    // texture dimensions divided by tile size is the number of tiles
+    return float3(TexSize / Tile, Tile);
+}
+
+
+// 3D coordinate from texture UV for tiled 3D texture
+// Tiles is float3(numXTiles, numYTiles, TileSize), as returned by TileSize()
+float3 TileUVtoXYZ(float3 Tiles, float2 uv) {
+    // scale so each unit in xy is one tile
+    // floor(xy) is tile number, frac(xy) is position within tile
+    float2 xy = uv * Tiles.xy;
+
+    // compute z from tile number, scaled to 0 at first tile and 1 at last
+    float z = floor(xy.x) / Tiles.z + floor(xy.y) / Tiles.y;
+
+    // rescale range to give 1/2 texel border in x,y and z to avoid tile artifacts
+    return (float3(frac(xy), z) * Tiles.z) / (Tiles.z - 1);
+}
+
+
+// Lookup in tiled texture
+// Tiles is float3(numXTiles, numYTiles, TileSize), as returned by TileSize()
+float4 TileLookup(Texture2D Texture, SamplerState TextureSampler, float3 Tiles, float3 xyz) {
+    // fold into 0-1 range for repeating
+    xyz = frac(xyz);
+    
+    // rescale range for 1/2 texel border
+    xyz *= (Tiles.z - 1) / Tiles.z;
+
+    // xy scaled down to the size the slice will be in the texture
+    float2 tilexy = xyz.xy / Tiles.xy;
+
+    // z scaled up to slice number (with possible fraction between slices)
+    float tilez = xyz.z * Tiles.z;
+
+    // look up slice below current z
+    float z0 = floor(tilez);
+    float2 uv0 = tilexy + float2(frac(z0 / Tiles.x), floor(z0 / Tiles.x) / Tiles.y);
+    float4 tx0 = Texture2DSample(Texture, TextureSampler, uv0); 
+
+    // look up slice above current z
+    float z1 = z0 + 1.0;
+    float2 uv1 = tilexy + float2(frac(z1 / Tiles.x), floor(z1 / Tiles.x) / Tiles.y);
+    float4 tx1 = Texture2DSample(Texture, TextureSampler, uv1);
+
+    // blend slices
+    return lerp(tx0, tx1, frac(tilez));
+}
+
+// return opacity from horizontal and altitude terms of general cloud shape
+float CloudShape(
+        float3 P,                                   // 3D position
+        Texture2D Texture, SamplerState Sampler,    // cloud shape red = horizontal shape, green = altitude/cloud type
+        float Inner, float Outer,                   // altitude limits of all clouds
+        float CloudFill)                            // how dense horizontally (0=none)
+{
+    float Plen = length(P);     // radius (altitude) of current P
+    float3 Pnorm = P / Plen;    // projection to unit sphere for horizontal terms
+
+    // just use xy component of sphere direction, can be stretched near P.z=0
+    float2 uv = Pnorm.xy * 0.5 + 0.5;
+    float4 Shape = Texture2DSample(Texture, Sampler, frac(uv));
+
+    // horizontal cloud shape, shifted by fill factor
+    float opacity = saturate(Shape.r + CloudFill - 1);
+
+    // radial (altitude) cloud limits
+    // could be three cases, but I fit a quadratic to the three points instead
+    // Also, I just did the top altitude, not both
+    float radialScale = (Plen - Inner) / (Outer - Inner);
+    float cloudBottom = 0.4 * Shape.g * (1 - Shape.g);
+    float cloudTop = 0.5 * (Shape.g * Shape.g) * (Shape.g * Shape.g) + 0.5;
+    opacity *= linearstep(cloudTop, cloudBottom, radialScale); // fade out at top
+    
+    return opacity;
+}
+
+// return opacity from cloud noise
+// P is current 3D position between inner and outer
+// Inner is an inner radius, below the lowest clouds
+// Outer is an outer radius, above the highest clouds
+float CloudDensity(
+        float3 P,                                               // 3D position
+        Texture2D Texture, SamplerState Sampler, float3 Tiles,  // cloud density texture
+        float Inner, float Outer)                               // altitude limits of clouds
+{
+    P.x += 25 * View.RealTime; // move with wind
+    return TileLookup(Texture, Sampler, Tiles, P / Inner).x;
+}
+
+// compute overall cloud through ray marching
+float4 Cloud(
+        Texture2D ShapeTexture, SamplerState ShapeSampler,      // cloud shape texture
+        Texture2D DensityTexture, SamplerState DensitySampler,  // cloud density texture
+        float3 WorldPosition,                                   // starting point of the ray
+        float2 SvPosition,                                      // screen pixel position
+        float3 RayDirection,                                    // direction for ray marching
+        float3 LightDirection,                                  // direction toward light
+        float MaxRaySteps,                                      // max if only fine steps are taken
+        float MaxShadowSteps,                                   // max steps for shadows
+        float CloudOpacity,                                     // opacity scale factor
+        float CloudFill,                                        // how dense the clouds are
+        float OuterScale)                                       // how thick the atmosphere (>1)
+{
+    float3 Tiles = TileSize(DensityTexture);
+   
+    float3 center = Primitive.ObjectWorldPositionAndRadius.xyz;
+    float inner = Primitive.ObjectWorldPositionAndRadius.w;
+
+    // could use outer-inner for MaxDistance, and that's what's in the assignment
+    // but that's only correct if viewing the sky from the origin
+    // otherwise, max when looking perpendicular to the vector from center to view
+    // call the distance from the center r.
+    // The inner radius is the hypotenuse of a right triangle, with R as one side
+    // The distance to the inner edge of the cloud layer is sqrt(inner^2 - r^2)
+    // Similarly, the distance to the outer edge is sqrt(outer^2 - r^2)
+    // The max distance is sqrt(outer^2 - r^2) - sqrt(inner^2 - r^2)
+    // This is largest when r=inner, so the view is right at the bottom of the clouds
+    // Then the max ray distance is sqrt(outer^2 - inner^2)
+    // assuming outer is s*inner, that's sqrt((s*inner)^2 - inner^2) = inner*sqrt(s^2 - 1)
+    float outer = inner * OuterScale;
+    float MaxDistance = inner * sqrt(OuterScale * OuterScale - 1);
+    float Rsq = outer * outer;
+    float3 P = WorldPosition - center;
+    
+    // per-step direction and opacity
+    float StepOpacity = saturate(CloudOpacity / MaxRaySteps);
+    float StepSize = (outer - inner) / MaxRaySteps;
+    StepSize = MaxDistance / MaxRaySteps;
+    float3 Step = StepSize * RayDirection;
+    float3 BigStep = 4 * Step;
+
+    // shadow ray and opacity calculations, just like for the primary ray
+    float ShadowStepOpacity = saturate(CloudOpacity / MaxShadowSteps);
+    float ShadowStepSize = MaxDistance / MaxShadowSteps;
+    float3 ShadowStep = ShadowStepSize * LightDirection;
+
+    // randomize first step to avoid visible stepping artifacts
+    int3 randpos = int3(SvPosition, View.FrameNumber);
+    P += BigStep * float(Rand3DPCG16(randpos).x) / 0x10000;
+    
+    // march through cloud
+    float4 color = 0;
+    for(int i=0; i < MaxRaySteps && dot(P, P) < Rsq; ++i)
+    {
+        // cloud shape for this point
+        float4 localColor = CloudShape(P, ShapeTexture, ShapeSampler, inner, outer, CloudFill);
+
+        // take a bit step if we're not in a cloud
+        if (localColor.a <= 0.01) {
+            P += BigStep;
+            continue;
+        }
+
+        // combine with the cloud density
+        localColor *= CloudDensity(P, DensityTexture, DensitySampler, Tiles, inner, outer);
+        
+        // embedded ray march for shadowing if still not transparent
+        if (localColor.a > 0.01) {
+            float3 spos = P + ShadowStep;
+            float shadow = 0;
+            for(int j=0; j < MaxShadowSteps && dot(spos, spos) < Rsq; ++j)
+            {
+                shadow += (1 - shadow) * ShadowStepOpacity *
+                    CloudShape(spos, ShapeTexture, ShapeSampler, inner, outer, CloudFill);
+                spos += ShadowStep;
+            }
+            localColor.rgb *= (1 - shadow);
+        }
+
+        // accumulate density
+        color += (1 - color.a) * StepOpacity * localColor;
+        
+        // update ray position
+        P += Step;
+    }
+
+    return color;
+}
